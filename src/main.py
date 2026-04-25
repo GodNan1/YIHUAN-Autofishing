@@ -366,7 +366,9 @@ def run_controller(args: argparse.Namespace) -> None:
     click_template = load_optional_template(Path(args.click_template))
     r_template = load_optional_template(Path(args.r_template))
     watchdog_timeout = max(0.0, float(args.watchdog_timeout))
+    watchdog_max_consecutive_timeouts = max(1, int(args.watchdog_max_consecutive_timeouts))
     last_any_detection_time = time.time()
+    watchdog_timeout_streak = 0
 
     if gw is None:
         raise RuntimeError("pygetwindow 未安装，请先执行: pip install pygetwindow")
@@ -728,16 +730,18 @@ def run_controller(args: argparse.Namespace) -> None:
                         r_hit = to_absolute_box(r_hit, bottom_right_region.offset_x, bottom_right_region.offset_y)
 
             if workflow_state == "slider":
-                if not anchors_effective_visible and click_hit is not None and now - last_click_time >= args.click_cooldown:
+                calibration_active = should_auto_estimate_speed and calibration_stage is not None
+
+                if (not calibration_active) and not anchors_effective_visible and click_hit is not None and now - last_click_time >= args.click_cooldown:
                     click_miss_start_time = None
                     click_delay = random.uniform(click_reaction_min, click_reaction_max)
                     if click_delay > 0:
                         time.sleep(click_delay)
 
-                    jitter_x = random.randint(0, max(0, click_hit.width - 1))
-                    jitter_y = random.randint(0, max(0, click_hit.height - 1))
-                    click_x = target_window.left + click_hit.left + jitter_x
-                    click_y = target_window.top + click_hit.top + jitter_y
+                    jitter_x = random.randint(-2, 2)
+                    jitter_y = random.randint(-2, 2)
+                    click_x = target_window.left + click_hit.center_x + jitter_x
+                    click_y = target_window.top + click_hit.center_y + jitter_y
                     pyautogui.click(click_x, click_y)
                     last_click_time = time.time()
                     click_gone_frames = 0
@@ -750,12 +754,13 @@ def run_controller(args: argparse.Namespace) -> None:
                         f"识别到模板 {args.click_template}，已点击一次，"
                         f"匹配分数: {click_hit.score:.3f}，延时: {click_delay * 1000:.0f}ms"
                     )
-                elif not anchors_effective_visible and click_hit is None and r_enabled:
+                elif (not calibration_active) and not anchors_effective_visible and click_hit is None and r_enabled:
                     if click_miss_start_time is None:
                         click_miss_start_time = now
                     if r_hit is not None:
                         workflow_state = "qe_phase"
                         last_any_detection_time = now
+                        watchdog_timeout_streak = 0
                         just_entered_qe = True 
                         assist_start_time = time.time()
                         last_slider_box = None
@@ -869,7 +874,7 @@ def run_controller(args: argparse.Namespace) -> None:
                                     calibration_stage = None
                                     calibration_finished = True
 
-                    if green_box is not None:
+                    if (not calibration_active) and green_box is not None:
                         control_slider_x = measured_slider_x
                         if control_slider_x is None:
                             control_slider_x = predictor.predict_at(now + args.control_lead_seconds, current_direction_key)
@@ -903,7 +908,7 @@ def run_controller(args: argparse.Namespace) -> None:
 
                                 if outside_pending_frames >= max(1, args.outside_confirm_frames):
                                     current_direction_key = update_direction_key(current_direction_key, desired_direction)
-                    else:
+                    elif not calibration_active:
                         if now - last_green_seen_time > args.green_lost_grace_seconds:
                             current_direction_key = update_direction_key(current_direction_key, None)
                             outside_direction_pending = None
@@ -924,6 +929,7 @@ def run_controller(args: argparse.Namespace) -> None:
                 if click_gone_frames >= args.click_disappear_frames:
                     workflow_state = "qe_phase"
                     last_any_detection_time = now 
+                    watchdog_timeout_streak = 0
                     just_entered_qe = True  
                     print("click 已消失，进入 Q_E 任务阶段。")
 
@@ -933,7 +939,7 @@ def run_controller(args: argparse.Namespace) -> None:
                     offset_x = target_window.left + 800 + random.randint(-50, 50)
                     offset_y = target_window.top + 750 + random.randint(-50, 50)
                     pyautogui.click(offset_x, offset_y)
-                    just_entered_qe = True
+                    just_entered_qe = False
                 click_miss_start_time = None
                 current_direction_key = update_direction_key(current_direction_key, None)
                 predictor.reset()
@@ -998,7 +1004,9 @@ def run_controller(args: argparse.Namespace) -> None:
 
             # ===== 看门狗超时检测 =====
             if watchdog_timeout > 0 and (now - last_any_detection_time) > watchdog_timeout:
+                watchdog_timeout_streak += 1
                 print(f"看门狗触发：{watchdog_timeout:.0f}秒无完整循环，重置到 Q_E 阶段。")
+                print(f"看门狗连续超时次数：{watchdog_timeout_streak}/{watchdog_max_consecutive_timeouts}")
                 workflow_state = "qe_phase"
                 just_entered_qe = True
                 current_direction_key = update_direction_key(current_direction_key, None)
@@ -1028,6 +1036,12 @@ def run_controller(args: argparse.Namespace) -> None:
                     calibration_wait_until = 0.0
                     print("自动估速已被看门狗终止。")
                 last_any_detection_time = now   # 重置后立即喂狗
+
+                if watchdog_timeout_streak >= watchdog_max_consecutive_timeouts:
+                    print(
+                        f"看门狗连续超时达到 {watchdog_timeout_streak} 次，自动停止项目。"
+                    )
+                    break
                 
             wait_next_frame(active_fps)
 
@@ -1127,6 +1141,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--click-reaction-max", type=float, default=0.20, help="click 最大随机延时(秒)")
     parser.add_argument("--init-center-assist-seconds", type=float, default=2.0, help="初始中心辅助时长(秒)")
     parser.add_argument("--watchdog-timeout", type=float, default=40.0, help="无动作重置的超时秒数,0 表示禁用")
+    parser.add_argument("--watchdog-max-consecutive-timeouts", type=int, default=10, help="看门狗连续超时多少次后自动停止项目")
     
     return parser
 
