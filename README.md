@@ -124,3 +124,4 @@ python src/main.py
 - 目标窗口保持可见并尽量固定缩放比例
 - 若识别不稳定，调高或调低对应阈值
 # autoFishing
+# autoFishing
