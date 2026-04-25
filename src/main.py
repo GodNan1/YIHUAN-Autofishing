@@ -365,6 +365,8 @@ def run_controller(args: argparse.Namespace) -> None:
     q_e_template = load_template(Path(args.qe_template))
     click_template = load_optional_template(Path(args.click_template))
     r_template = load_optional_template(Path(args.r_template))
+    watchdog_timeout = max(0.0, float(args.watchdog_timeout))
+    last_any_detection_time = time.time()
 
     if gw is None:
         raise RuntimeError("pygetwindow 未安装，请先执行: pip install pygetwindow")
@@ -446,6 +448,8 @@ def run_controller(args: argparse.Namespace) -> None:
 
     outside_direction_pending: Optional[str] = None
     outside_pending_frames = 0
+
+    just_entered_qe = False   # 新增：标记是否刚进入 qe_phase
 
     if should_auto_estimate_speed:
         print("开始自动估速: 长按 A 到左边停住 -> 长按 D 到右边停住")
@@ -751,6 +755,8 @@ def run_controller(args: argparse.Namespace) -> None:
                         click_miss_start_time = now
                     if r_hit is not None:
                         workflow_state = "qe_phase"
+                        last_any_detection_time = now
+                        just_entered_qe = True 
                         assist_start_time = time.time()
                         last_slider_box = None
                         slider_lost_count = 0
@@ -917,9 +923,17 @@ def run_controller(args: argparse.Namespace) -> None:
 
                 if click_gone_frames >= args.click_disappear_frames:
                     workflow_state = "qe_phase"
+                    last_any_detection_time = now 
+                    just_entered_qe = True  
                     print("click 已消失，进入 Q_E 任务阶段。")
 
             elif workflow_state == "qe_phase":
+                if just_entered_qe:
+                    # 点击窗口内 (800±50, 750±50) 区域
+                    offset_x = target_window.left + 800 + random.randint(-50, 50)
+                    offset_y = target_window.top + 750 + random.randint(-50, 50)
+                    pyautogui.click(offset_x, offset_y)
+                    just_entered_qe = True
                 click_miss_start_time = None
                 current_direction_key = update_direction_key(current_direction_key, None)
                 predictor.reset()
@@ -980,7 +994,41 @@ def run_controller(args: argparse.Namespace) -> None:
                 current_direction_key = update_direction_key(current_direction_key, None)
                 print(calibration_finished_message)
                 break
+            
 
+            # ===== 看门狗超时检测 =====
+            if watchdog_timeout > 0 and (now - last_any_detection_time) > watchdog_timeout:
+                print(f"看门狗触发：{watchdog_timeout:.0f}秒无完整循环，重置到 Q_E 阶段。")
+                workflow_state = "qe_phase"
+                just_entered_qe = True
+                current_direction_key = update_direction_key(current_direction_key, None)
+                predictor.reset()
+                last_f_press_time = 0.0
+                last_click_time = 0.0
+                click_gone_frames = 0
+                click_miss_start_time = None
+                previous_anchors_visible = False
+                last_anchors_seen_time = 0.0
+                last_green_seen_time = 0.0
+                last_control_target_seen_time = 0.0
+                last_valid_green_box = None
+                last_slider_box = None
+                slider_lost_count = 0
+                assist_start_time = time.time()
+                outside_direction_pending = None
+                outside_pending_frames = 0
+                if should_auto_estimate_speed:
+                    should_auto_estimate_speed = False
+                    calibration_stage = None
+                    calibration_prev_measure = None
+                    calibration_seen_motion = False
+                    calibration_still_frames = 0
+                    left_speed_samples.clear()
+                    right_speed_samples.clear()
+                    calibration_wait_until = 0.0
+                    print("自动估速已被看门狗终止。")
+                last_any_detection_time = now   # 重置后立即喂狗
+                
             wait_next_frame(active_fps)
 
     except KeyboardInterrupt:
@@ -1073,12 +1121,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--r-threshold", type=float, default=0.80, help="R 模板匹配阈值")
     parser.add_argument("--r-detect-delay-after-click-miss", type=float, default=1.0, help="click miss 后延迟检测 R 秒数")
     parser.add_argument("--click-cooldown", type=float, default=1.0, help="click 点击冷却(秒)")
-    parser.add_argument("--click-detect-duration", type=float, default=2.0, help="进入收尾阶段后 click 识别持续时长(秒)")
+    parser.add_argument("--click-detect-duration", type=float, default=10.0, help="进入收尾阶段后 click 识别持续时长(秒)")
     parser.add_argument("--click-disappear-frames", type=int, default=3, help="click 消失判定连续帧数")
     parser.add_argument("--click-reaction-min", type=float, default=0.10, help="click 最小随机延时(秒)")
     parser.add_argument("--click-reaction-max", type=float, default=0.20, help="click 最大随机延时(秒)")
     parser.add_argument("--init-center-assist-seconds", type=float, default=2.0, help="初始中心辅助时长(秒)")
-
+    parser.add_argument("--watchdog-timeout", type=float, default=40.0, help="无动作重置的超时秒数,0 表示禁用")
+    
     return parser
 
 

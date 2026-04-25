@@ -1,4 +1,7 @@
-# OpenCV 模板识别自动控制
+# YIHUAN-Autofishing
+
+基于 OpenCV 模板识别的自动控制项目，当前仓库地址为：
+https://github.com/GodNan1/YIHUAN-Autofishing
 
 本项目通过 OpenCV 模板匹配实现以下控制逻辑：
 - 先识别 `Q_E.png`，再识别 `F.png`，之后进入 `huakuai.png` 的 A / D 控制任务
@@ -123,4 +126,5 @@ python src/main.py
 建议：
 - 目标窗口保持可见并尽量固定缩放比例
 - 若识别不稳定，调高或调低对应阈值
+# autoFishing
 # autoFishing
