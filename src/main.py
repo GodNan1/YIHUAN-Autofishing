@@ -19,7 +19,11 @@ except ImportError:
 
 # Macro-like switch: when enabled, auto speed calibration only runs A/D sampling
 # and disables slider tracking control plus click/R tail workflow.
-CALIBRATION_PURE_MODE = False
+CALIBRATION_PURE_MODE = True
+
+# Macro-like switch: when enabled, startup behaves as if
+# --force-reestimate-speed is provided from command line.
+FORCE_REESTIMATE_SPEED_ON_START = False
 
 
 @dataclass
@@ -1014,10 +1018,64 @@ def run_controller(args: argparse.Namespace) -> None:
             # ===== 看门狗超时检测 =====
             if watchdog_timeout > 0 and (now - last_any_detection_time) > watchdog_timeout:
                 watchdog_timeout_streak += 1
-                print(f"看门狗触发：{watchdog_timeout:.0f}秒无完整循环，重置到 Q_E 阶段。")
+                print(f"看门狗触发：{watchdog_timeout:.0f}秒无完整循环，尝试检测并恢复卡住阶段。")
                 print(f"看门狗连续超时次数：{watchdog_timeout_streak}/{watchdog_max_consecutive_timeouts}")
-                workflow_state = "qe_phase"
-                just_entered_qe = True
+
+                # 快速检测当前屏幕，判断卡在什么阶段，尽量恢复到该阶段继续尝试
+                # 准备检测用的区域
+                qr_bottom = build_bottom_right_region(screen_gray, args.trigger_region_width, args.trigger_region_height)
+                qr_upper = build_upper_middle_region(screen_gray, args.f_search_width_ratio)
+                anchors_upper = build_upper_middle_region(screen_gray, args.search_width_ratio)
+
+                detected_stage = None
+
+                # 检测 Q_E
+                if qr_bottom is not None:
+                    q_e_hit = locate_template(qr_bottom.image, q_e_template, args.qe_threshold, args.enable_blur, blur_kernel)
+                    if q_e_hit is not None:
+                        detected_stage = "qe_phase"
+
+                # 检测 F
+                if detected_stage is None and qr_upper is not None:
+                    f_hit = locate_template(qr_upper.image, f_template, args.f_threshold, args.enable_blur, blur_kernel)
+                    if f_hit is not None:
+                        detected_stage = "f_phase"
+
+                # 检测 anchors / green
+                if detected_stage is None and anchors_upper is not None:
+                    yu_h = locate_template(anchors_upper.image, yu_template, args.yu_threshold, args.enable_blur, blur_kernel)
+                    yux_h = locate_template(anchors_upper.image, yuxian_template, args.yuxian_threshold, args.enable_blur, blur_kernel)
+                    yu_h = to_absolute_box(yu_h, anchors_upper.offset_x, anchors_upper.offset_y) if yu_h is not None else None
+                    yux_h = to_absolute_box(yux_h, anchors_upper.offset_x, anchors_upper.offset_y) if yux_h is not None else None
+                    if yu_h is not None and yux_h is not None:
+                        anchors_reg = build_between_anchors_region(screen_gray, yu_h, yux_h, args.anchor_padding, args.anchor_vertical_padding)
+                        if anchors_reg is not None:
+                            green_h = find_green_box_in_region(screen_bgr, anchors_reg, args.green_lower_hsv, args.green_upper_hsv, args.green_min_area)
+                            if green_h is not None:
+                                detected_stage = "slider"
+                            else:
+                                detected_stage = "slider"
+
+                # 检测 click
+                if detected_stage is None:
+                    click_h = None
+                    if click_template is not None:
+                        click_h = locate_template(screen_gray, click_template, args.click_threshold, args.enable_blur, blur_kernel)
+                    if click_h is not None:
+                        detected_stage = "wait_click_disappear"
+
+                # 检测 R
+                if detected_stage is None and qr_bottom is not None and r_template is not None:
+                    r_h = locate_template(qr_bottom.image, r_template, args.r_threshold, args.enable_blur, blur_kernel)
+                    if r_h is not None:
+                        detected_stage = "qe_phase"
+
+                if detected_stage is None:
+                    detected_stage = "qe_phase"
+
+                workflow_state = detected_stage
+                just_entered_qe = True if workflow_state == "qe_phase" else False
+
                 current_direction_key = update_direction_key(current_direction_key, None)
                 predictor.reset()
                 last_f_press_time = 0.0
@@ -1150,13 +1208,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--click-reaction-max", type=float, default=0.20, help="click 最大随机延时(秒)")
     parser.add_argument("--init-center-assist-seconds", type=float, default=2.0, help="初始中心辅助时长(秒)")
     parser.add_argument("--watchdog-timeout", type=float, default=40.0, help="无动作重置的超时秒数,0 表示禁用")
-    parser.add_argument("--watchdog-max-consecutive-timeouts", type=int, default=10, help="看门狗连续超时多少次后自动停止项目")
+    parser.add_argument("--watchdog-max-consecutive-timeouts", type=int, default=3, help="看门狗连续超时多少次后自动停止项目")
     
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if FORCE_REESTIMATE_SPEED_ON_START:
+        args.force_reestimate_speed = True
+        args.auto_estimate_speed = True
     run_controller(args)
 
 
