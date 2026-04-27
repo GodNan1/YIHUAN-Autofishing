@@ -17,6 +17,11 @@ except ImportError:
     gw = None
 
 
+# Macro-like switch: when enabled, auto speed calibration only runs A/D sampling
+# and disables slider tracking control plus click/R tail workflow.
+CALIBRATION_PURE_MODE = False
+
+
 @dataclass
 class MatchBox:
     left: int
@@ -730,7 +735,11 @@ def run_controller(args: argparse.Namespace) -> None:
                         r_hit = to_absolute_box(r_hit, bottom_right_region.offset_x, bottom_right_region.offset_y)
 
             if workflow_state == "slider":
-                calibration_active = should_auto_estimate_speed and calibration_stage is not None
+                calibration_active = (
+                    CALIBRATION_PURE_MODE
+                    and should_auto_estimate_speed
+                    and calibration_stage is not None
+                )
 
                 if (not calibration_active) and not anchors_effective_visible and click_hit is not None and now - last_click_time >= args.click_cooldown:
                     click_miss_start_time = None
