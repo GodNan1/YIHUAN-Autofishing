@@ -19,7 +19,7 @@ except ImportError:
 
 # Macro-like switch: when enabled, auto speed calibration only runs A/D sampling
 # and disables slider tracking control plus click/R tail workflow.
-CALIBRATION_PURE_MODE = True
+CALIBRATION_PURE_MODE = False
 
 # Macro-like switch: when enabled, startup behaves as if
 # --force-reestimate-speed is provided from command line.
@@ -318,6 +318,10 @@ def find_green_box_in_region(
     lower_hsv: Tuple[int, int, int],
     upper_hsv: Tuple[int, int, int],
     min_area: int,
+    target_center_x: Optional[float] = None,
+    x_tolerance: int = 120,
+    target_height: Optional[float] = None,
+    height_ratio_tolerance: float = 0.6,
 ) -> Optional[MatchBox]:
     x0 = region.offset_x
     y0 = region.offset_y
@@ -342,6 +346,18 @@ def find_green_box_in_region(
         if area < min_area:
             continue
         x, y, ww, hh = cv2.boundingRect(contour)
+
+        if target_center_x is not None:
+            contour_center_x = float(x0 + x + ww / 2.0)
+            if abs(contour_center_x - float(target_center_x)) > max(1, int(x_tolerance)):
+                continue
+
+        if target_height is not None and target_height > 0:
+            min_h = float(target_height) * max(0.0, 1.0 - float(height_ratio_tolerance))
+            max_h = float(target_height) * (1.0 + float(height_ratio_tolerance))
+            if not (min_h <= float(hh) <= max_h):
+                continue
+
         if area > best_area:
             best_area = area
             best = (x, y, ww, hh)
@@ -567,7 +583,7 @@ def run_controller(args: argparse.Namespace) -> None:
                         args.anchor_padding,
                         args.anchor_vertical_padding,
                     )
-                    if anchors_region is not None:
+                    if anchors_region is not None and workflow_state != "slider":
                         green_box = find_green_box_in_region(
                             screen_bgr,
                             anchors_region,
@@ -576,15 +592,9 @@ def run_controller(args: argparse.Namespace) -> None:
                             args.green_min_area,
                         )
 
-                if green_box is not None:
+                if workflow_state != "slider" and green_box is not None:
                     last_green_seen_time = now
                     last_valid_green_box = green_box
-                elif (
-                    workflow_state == "slider"
-                    and last_valid_green_box is not None
-                    and now - last_green_seen_time <= args.green_lost_grace_seconds
-                ):
-                    green_box = last_valid_green_box
 
                 if click_enabled and (
                     workflow_state == "wait_click_disappear"
@@ -724,6 +734,38 @@ def run_controller(args: argparse.Namespace) -> None:
                         last_slider_box = None
                         slider_lost_count = 0
 
+                # 先识别滑块，再按滑块X轴位置与高度约束识别绿色区域，减少背景误检。
+                if anchors_region is not None:
+                    x_hint = None
+                    h_hint = None
+                    if slider_box is not None:
+                        x_hint = float(slider_box.center_x)
+                        h_hint = float(slider_box.height)
+                    elif last_slider_box is not None:
+                        x_hint = float(last_slider_box.center_x)
+                        h_hint = float(last_slider_box.height)
+
+                    green_box = find_green_box_in_region(
+                        screen_bgr,
+                        anchors_region,
+                        args.green_lower_hsv,
+                        args.green_upper_hsv,
+                        args.green_min_area,
+                        target_center_x=x_hint,
+                        x_tolerance=args.green_x_tolerance,
+                        target_height=h_hint,
+                        height_ratio_tolerance=args.green_height_ratio_tolerance,
+                    )
+
+                if green_box is not None:
+                    last_green_seen_time = now
+                    last_valid_green_box = green_box
+                elif (
+                    last_valid_green_box is not None
+                    and now - last_green_seen_time <= args.green_lost_grace_seconds
+                ):
+                    green_box = last_valid_green_box
+
                 if r_enabled and click_hit is None and not anchors_effective_visible and bottom_right_region is not None:
                     if click_miss_start_time is not None and (
                         now - click_miss_start_time
@@ -755,7 +797,7 @@ def run_controller(args: argparse.Namespace) -> None:
                     jitter_y = random.randint(-2, 2)
                     click_x = target_window.left + click_hit.center_x + jitter_x
                     click_y = target_window.top + click_hit.center_y + jitter_y
-                    pyautogui.click(click_x, click_y)
+                    pyautogui.press("esc")
                     last_click_time = time.time()
                     click_gone_frames = 0
                     workflow_state = "wait_click_disappear"
@@ -764,7 +806,7 @@ def run_controller(args: argparse.Namespace) -> None:
                     outside_direction_pending = None
                     outside_pending_frames = 0
                     print(
-                        f"识别到模板 {args.click_template}，已点击一次，"
+                        f"识别到模板 {args.click_template}，已按下 ESC，"
                         f"匹配分数: {click_hit.score:.3f}，延时: {click_delay * 1000:.0f}ms"
                     )
                 elif (not calibration_active) and not anchors_effective_visible and click_hit is None and r_enabled:
@@ -1168,6 +1210,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="绿色识别上限 HSV，格式 H,S,V，默认 90,255,255",
     )
     parser.add_argument("--green-min-area", type=int, default=200, help="绿色区域最小面积阈值")
+    parser.add_argument("--green-x-tolerance", type=int, default=120, help="绿色区域与滑块中心X轴容差像素")
+    parser.add_argument("--green-height-ratio-tolerance", type=float, default=0.6, help="绿色区域高度相对滑块高度的容差比例")
     parser.add_argument("--anchor-padding", type=int, default=5, help="左右锚点向内收缩像素")
     parser.add_argument("--anchor-vertical-padding", type=int, default=25, help="锚点上下扩展像素")
 
