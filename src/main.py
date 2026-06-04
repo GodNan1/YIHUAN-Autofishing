@@ -2,6 +2,7 @@ import argparse
 import json
 import random
 import time
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -15,6 +16,118 @@ try:
     import pygetwindow as gw
 except ImportError:
     gw = None
+
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_ABSOLUTE = 0x8000
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+
+VK_CODE_MAP = {
+    "a": 0x41,
+    "d": 0x44,
+    "f": 0x46,
+    "q": 0x51,
+    "e": 0x45,
+    "esc": 0x1B,
+    "space": 0x20,
+    "enter": 0x0D,
+}
+
+
+class _MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_uint),
+        ("dwFlags", ctypes.c_uint),
+        ("time", ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _KeyboardInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_uint),
+        ("time", ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = [("mi", _MouseInput), ("ki", _KeyboardInput)]
+
+
+class _Input(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_uint), ("u", _InputUnion)]
+
+
+def send_left_click_sendinput(screen_x: int, screen_y: int) -> None:
+    user32 = ctypes.windll.user32
+    screen_width = max(1, int(user32.GetSystemMetrics(0)) - 1)
+    screen_height = max(1, int(user32.GetSystemMetrics(1)) - 1)
+    absolute_x = int(screen_x * 65535 / screen_width)
+    absolute_y = int(screen_y * 65535 / screen_height)
+
+    inputs = (_Input * 3)()
+    inputs[0].type = INPUT_MOUSE
+    inputs[0].mi = _MouseInput(absolute_x, absolute_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, None)
+    inputs[1].type = INPUT_MOUSE
+    inputs[1].mi = _MouseInput(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)
+    inputs[2].type = INPUT_MOUSE
+    inputs[2].mi = _MouseInput(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)
+    user32.SendInput(3, ctypes.byref(inputs), ctypes.sizeof(_Input))
+
+
+def _vk_code_for_key(key: str) -> int:
+    normalized = key.strip().lower()
+    if len(normalized) == 1 and "a" <= normalized <= "z":
+        return ord(normalized.upper())
+    if normalized not in VK_CODE_MAP:
+        raise ValueError(f"Unsupported key for SendInput: {key}")
+    return VK_CODE_MAP[normalized]
+
+
+def send_key_sendinput(key: str, key_up: bool = False) -> None:
+    user32 = ctypes.windll.user32
+    input_event = _Input()
+    input_event.type = INPUT_KEYBOARD
+    input_event.ki = _KeyboardInput(_vk_code_for_key(key), 0, KEYEVENTF_KEYUP if key_up else 0, 0, None)
+    user32.SendInput(1, ctypes.byref(input_event), ctypes.sizeof(_Input))
+
+
+def press_key_sendinput(key: str) -> None:
+    # For ESC use scan code injection which some games accept when VK events are ignored
+    if key.strip().lower() == "esc":
+        user32 = ctypes.windll.user32
+        vk = _vk_code_for_key(key)
+        sc = user32.MapVirtualKeyW(vk, 0)
+        # key down via scan code
+        evt = _Input()
+        evt.type = INPUT_KEYBOARD
+        evt.ki = _KeyboardInput(0, sc, KEYEVENTF_SCANCODE, 0, None)
+        user32.SendInput(1, ctypes.byref(evt), ctypes.sizeof(_Input))
+        time.sleep(0.03)
+        # key up via scan code
+        evt_up = _Input()
+        evt_up.type = INPUT_KEYBOARD
+        evt_up.ki = _KeyboardInput(0, sc, KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE, 0, None)
+        user32.SendInput(1, ctypes.byref(evt_up), ctypes.sizeof(_Input))
+        time.sleep(0.01)
+        # Fallback for games that only respond to legacy keybd_event path
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.03)
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+    else:
+        send_key_sendinput(key, key_up=False)
+        send_key_sendinput(key, key_up=True)
 
 
 # Macro-like switch: when enabled, auto speed calibration only runs A/D sampling
@@ -64,6 +177,7 @@ class WindowRect:
     top: int
     width: int
     height: int
+    hwnd: Optional[int] = None
 
 
 class ConstantSpeedPredictor:
@@ -182,8 +296,23 @@ def find_target_window(title_part: str, width: int, height: int, tolerance: int)
         if window.width <= 0 or window.height <= 0:
             continue
         if abs(window.width - width) <= tolerance and abs(window.height - height) <= tolerance:
-            return WindowRect(window.left, window.top, window.width, window.height)
+            hwnd = getattr(window, "_hWnd", None)
+            return WindowRect(window.left, window.top, window.width, window.height, hwnd=hwnd)
     return None
+
+
+def bring_window_foreground(hwnd: Optional[int]) -> None:
+    if not hwnd:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+    except Exception:
+        pass
 
 
 def capture_window_images(window_rect: WindowRect) -> Tuple[np.ndarray, np.ndarray]:
@@ -374,10 +503,10 @@ def update_direction_key(current_key: Optional[str], new_key: Optional[str]) -> 
         return current_key
 
     if current_key is not None:
-        pyautogui.keyUp(current_key)
+        send_key_sendinput(current_key, key_up=True)
 
     if new_key is not None:
-        pyautogui.keyDown(new_key)
+        send_key_sendinput(new_key, key_up=False)
 
     return new_key
 
@@ -443,6 +572,11 @@ def run_controller(args: argparse.Namespace) -> None:
     click_reaction_max = max(0.0, float(args.click_reaction_max))
     if click_reaction_min > click_reaction_max:
         click_reaction_min, click_reaction_max = click_reaction_max, click_reaction_min
+    click_post_esc_delay_min = max(0.0, float(args.click_post_esc_delay_min))
+    click_post_esc_delay_max = max(0.0, float(args.click_post_esc_delay_max))
+    if click_post_esc_delay_min > click_post_esc_delay_max:
+        click_post_esc_delay_min, click_post_esc_delay_max = click_post_esc_delay_max, click_post_esc_delay_min
+    wait_click_restart_timeout = max(0.0, float(args.wait_click_restart_timeout))
     click_detect_duration = max(0.0, float(args.click_detect_duration))
 
     speed_cache_path = Path(args.speed_cache_file)
@@ -475,6 +609,7 @@ def run_controller(args: argparse.Namespace) -> None:
 
     outside_direction_pending: Optional[str] = None
     outside_pending_frames = 0
+    wait_click_state_enter_time: Optional[float] = None
 
     just_entered_qe = False   # 新增：标记是否刚进入 qe_phase
 
@@ -490,6 +625,52 @@ def run_controller(args: argparse.Namespace) -> None:
             time.sleep(sleep_time)
         else:
             next_frame_time = time.perf_counter()
+
+    def detect_recovery_stage(screen_bgr: np.ndarray, screen_gray: np.ndarray) -> str:
+        qr_bottom = build_bottom_right_region(screen_gray, args.trigger_region_width, args.trigger_region_height)
+        qr_upper = build_upper_middle_region(screen_gray, args.f_search_width_ratio)
+        anchors_upper = build_upper_middle_region(screen_gray, args.search_width_ratio)
+
+        detected_stage: Optional[str] = None
+
+        if qr_bottom is not None:
+            q_e_hit = locate_template(qr_bottom.image, q_e_template, args.qe_threshold, args.enable_blur, blur_kernel)
+            if q_e_hit is not None:
+                detected_stage = "qe_phase"
+
+        if detected_stage is None and qr_upper is not None:
+            f_hit = locate_template(qr_upper.image, f_template, args.f_threshold, args.enable_blur, blur_kernel)
+            if f_hit is not None:
+                detected_stage = "f_phase"
+
+        if detected_stage is None and anchors_upper is not None:
+            yu_h = locate_template(anchors_upper.image, yu_template, args.yu_threshold, args.enable_blur, blur_kernel)
+            yux_h = locate_template(anchors_upper.image, yuxian_template, args.yuxian_threshold, args.enable_blur, blur_kernel)
+            yu_h = to_absolute_box(yu_h, anchors_upper.offset_x, anchors_upper.offset_y) if yu_h is not None else None
+            yux_h = to_absolute_box(yux_h, anchors_upper.offset_x, anchors_upper.offset_y) if yux_h is not None else None
+            if yu_h is not None and yux_h is not None:
+                anchors_reg = build_between_anchors_region(screen_gray, yu_h, yux_h, args.anchor_padding, args.anchor_vertical_padding)
+                if anchors_reg is not None:
+                    green_h = find_green_box_in_region(screen_bgr, anchors_reg, args.green_lower_hsv, args.green_upper_hsv, args.green_min_area)
+                    if green_h is not None:
+                        detected_stage = "slider"
+                    else:
+                        detected_stage = "slider"
+
+        if detected_stage is None and click_template is not None:
+            click_h = locate_template(screen_gray, click_template, args.click_threshold, args.enable_blur, blur_kernel)
+            if click_h is not None:
+                detected_stage = "wait_click_disappear"
+
+        if detected_stage is None and qr_bottom is not None and r_template is not None:
+            r_h = locate_template(qr_bottom.image, r_template, args.r_threshold, args.enable_blur, blur_kernel)
+            if r_h is not None:
+                detected_stage = "qe_phase"
+
+        if detected_stage is None:
+            detected_stage = "qe_phase"
+
+        return detected_stage
 
     print("开始识别，按 Ctrl+C 停止。")
 
@@ -793,14 +974,18 @@ def run_controller(args: argparse.Namespace) -> None:
                     if click_delay > 0:
                         time.sleep(click_delay)
 
-                    jitter_x = random.randint(-2, 2)
-                    jitter_y = random.randint(-2, 2)
-                    click_x = target_window.left + click_hit.center_x + jitter_x
-                    click_y = target_window.top + click_hit.center_y + jitter_y
-                    pyautogui.press("esc")
+                    bring_window_foreground(target_window.hwnd)
+                    press_key_sendinput("esc")
+                    click_post_esc_delay = random.uniform(click_post_esc_delay_min, click_post_esc_delay_max)
+                    if click_post_esc_delay > 0:
+                        time.sleep(click_post_esc_delay)
                     last_click_time = time.time()
+                    # 喂看门狗：在识别到 click 并发送 ESC 后，重置最近一次完整检测时间，避免被误判为卡住
+                    last_any_detection_time = time.time()
+                    watchdog_timeout_streak = 0
                     click_gone_frames = 0
                     workflow_state = "wait_click_disappear"
+                    wait_click_state_enter_time = now
                     current_direction_key = update_direction_key(current_direction_key, None)
                     predictor.reset()
                     outside_direction_pending = None
@@ -983,17 +1168,37 @@ def run_controller(args: argparse.Namespace) -> None:
 
                 if click_gone_frames >= args.click_disappear_frames:
                     workflow_state = "qe_phase"
+                    wait_click_state_enter_time = None
                     last_any_detection_time = now 
                     watchdog_timeout_streak = 0
                     just_entered_qe = True  
                     print("click 已消失，进入 Q_E 任务阶段。")
+                elif (
+                    wait_click_restart_timeout > 0
+                    and wait_click_state_enter_time is not None
+                    and (now - wait_click_state_enter_time) >= wait_click_restart_timeout
+                ):
+                    recovered_stage = detect_recovery_stage(screen_bgr, screen_gray)
+                    workflow_state = recovered_stage
+                    wait_click_state_enter_time = now if workflow_state == "wait_click_disappear" else None
+                    click_gone_frames = 0
+                    just_entered_qe = workflow_state == "qe_phase"
+                    last_any_detection_time = now
+                    watchdog_timeout_streak = 0
+                    print(
+                        f"按下 ESC 后 {wait_click_restart_timeout:.1f}s 未重启，"
+                        f"已执行阶段重检并切换到: {workflow_state}"
+                    )
 
             elif workflow_state == "qe_phase":
                 if just_entered_qe:
                     # 点击窗口内 (800±50, 750±50) 区域
                     offset_x = target_window.left + 800 + random.randint(-50, 50)
                     offset_y = target_window.top + 750 + random.randint(-50, 50)
-                    pyautogui.click(offset_x, offset_y)
+                    original_mouse_x, original_mouse_y = pyautogui.position()
+                    bring_window_foreground(target_window.hwnd)
+                    send_left_click_sendinput(offset_x, offset_y)
+                    pyautogui.moveTo(original_mouse_x, original_mouse_y, duration=0)
                     just_entered_qe = False
                 click_miss_start_time = None
                 current_direction_key = update_direction_key(current_direction_key, None)
@@ -1005,7 +1210,7 @@ def run_controller(args: argparse.Namespace) -> None:
                     delay = random.uniform(f_reaction_min, f_reaction_max)
                     if delay > 0:
                         time.sleep(delay)
-                    pyautogui.press("f")
+                    press_key_sendinput("f")
                     last_f_press_time = time.time()
                     workflow_state = "f_phase"
                     print(
@@ -1024,7 +1229,7 @@ def run_controller(args: argparse.Namespace) -> None:
                     delay = random.uniform(f_reaction_min, f_reaction_max)
                     if delay > 0:
                         time.sleep(delay)
-                    pyautogui.press("f")
+                    press_key_sendinput("f")
                     last_f_press_time = time.time()
                     workflow_state = "slider"
                     assist_start_time = time.time()
@@ -1064,58 +1269,10 @@ def run_controller(args: argparse.Namespace) -> None:
                 print(f"看门狗连续超时次数：{watchdog_timeout_streak}/{watchdog_max_consecutive_timeouts}")
 
                 # 快速检测当前屏幕，判断卡在什么阶段，尽量恢复到该阶段继续尝试
-                # 准备检测用的区域
-                qr_bottom = build_bottom_right_region(screen_gray, args.trigger_region_width, args.trigger_region_height)
-                qr_upper = build_upper_middle_region(screen_gray, args.f_search_width_ratio)
-                anchors_upper = build_upper_middle_region(screen_gray, args.search_width_ratio)
-
-                detected_stage = None
-
-                # 检测 Q_E
-                if qr_bottom is not None:
-                    q_e_hit = locate_template(qr_bottom.image, q_e_template, args.qe_threshold, args.enable_blur, blur_kernel)
-                    if q_e_hit is not None:
-                        detected_stage = "qe_phase"
-
-                # 检测 F
-                if detected_stage is None and qr_upper is not None:
-                    f_hit = locate_template(qr_upper.image, f_template, args.f_threshold, args.enable_blur, blur_kernel)
-                    if f_hit is not None:
-                        detected_stage = "f_phase"
-
-                # 检测 anchors / green
-                if detected_stage is None and anchors_upper is not None:
-                    yu_h = locate_template(anchors_upper.image, yu_template, args.yu_threshold, args.enable_blur, blur_kernel)
-                    yux_h = locate_template(anchors_upper.image, yuxian_template, args.yuxian_threshold, args.enable_blur, blur_kernel)
-                    yu_h = to_absolute_box(yu_h, anchors_upper.offset_x, anchors_upper.offset_y) if yu_h is not None else None
-                    yux_h = to_absolute_box(yux_h, anchors_upper.offset_x, anchors_upper.offset_y) if yux_h is not None else None
-                    if yu_h is not None and yux_h is not None:
-                        anchors_reg = build_between_anchors_region(screen_gray, yu_h, yux_h, args.anchor_padding, args.anchor_vertical_padding)
-                        if anchors_reg is not None:
-                            green_h = find_green_box_in_region(screen_bgr, anchors_reg, args.green_lower_hsv, args.green_upper_hsv, args.green_min_area)
-                            if green_h is not None:
-                                detected_stage = "slider"
-                            else:
-                                detected_stage = "slider"
-
-                # 检测 click
-                if detected_stage is None:
-                    click_h = None
-                    if click_template is not None:
-                        click_h = locate_template(screen_gray, click_template, args.click_threshold, args.enable_blur, blur_kernel)
-                    if click_h is not None:
-                        detected_stage = "wait_click_disappear"
-
-                # 检测 R
-                if detected_stage is None and qr_bottom is not None and r_template is not None:
-                    r_h = locate_template(qr_bottom.image, r_template, args.r_threshold, args.enable_blur, blur_kernel)
-                    if r_h is not None:
-                        detected_stage = "qe_phase"
-
-                if detected_stage is None:
-                    detected_stage = "qe_phase"
+                detected_stage = detect_recovery_stage(screen_bgr, screen_gray)
 
                 workflow_state = detected_stage
+                wait_click_state_enter_time = now if workflow_state == "wait_click_disappear" else None
                 just_entered_qe = True if workflow_state == "qe_phase" else False
 
                 current_direction_key = update_direction_key(current_direction_key, None)
@@ -1248,8 +1405,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--click-cooldown", type=float, default=1.0, help="click 点击冷却(秒)")
     parser.add_argument("--click-detect-duration", type=float, default=10.0, help="进入收尾阶段后 click 识别持续时长(秒)")
     parser.add_argument("--click-disappear-frames", type=int, default=3, help="click 消失判定连续帧数")
-    parser.add_argument("--click-reaction-min", type=float, default=0.10, help="click 最小随机延时(秒)")
-    parser.add_argument("--click-reaction-max", type=float, default=0.20, help="click 最大随机延时(秒)")
+    parser.add_argument("--click-reaction-min", type=float, default=0.20, help="click 最小随机延时(秒)")
+    parser.add_argument("--click-reaction-max", type=float, default=0.45, help="click 最大随机延时(秒)")
+    parser.add_argument("--click-post-esc-delay-min", type=float, default=0.23, help="按下 ESC 后最小额外等待时间(秒)")
+    parser.add_argument("--click-post-esc-delay-max", type=float, default=0.75, help="按下 ESC 后最大额外等待时间(秒)")
+    parser.add_argument("--wait-click-restart-timeout", type=float, default=5.0, help="按下 ESC 后等待重启超时(秒)，超时后执行阶段重检")
     parser.add_argument("--init-center-assist-seconds", type=float, default=2.0, help="初始中心辅助时长(秒)")
     parser.add_argument("--watchdog-timeout", type=float, default=40.0, help="无动作重置的超时秒数,0 表示禁用")
     parser.add_argument("--watchdog-max-consecutive-timeouts", type=int, default=3, help="看门狗连续超时多少次后自动停止项目")
@@ -1263,7 +1423,6 @@ def main() -> None:
         args.force_reestimate_speed = True
         args.auto_estimate_speed = True
     run_controller(args)
-
 
 if __name__ == "__main__":
     main()

@@ -80,8 +80,11 @@ python src/main.py --slider-template huakuai.png --yu-template yu.png ...
 - `--click-cooldown`：click 点击冷却（秒），默认 `1.0`
 - `--click-detect-duration`：收尾阶段 click 检测持续时长（秒），默认 `10.0`
 - `--click-disappear-frames`：click 消失判定连续帧数，默认 `3`
-- `--click-reaction-min`：click 最小随机延时（秒），默认 `0.10`
-- `--click-reaction-max`：click 最大随机延时（秒），默认 `0.20`
+- `--click-reaction-min`：click 最小随机延时（秒），默认 `0.20`
+- `--click-reaction-max`：click 最大随机延时（秒），默认 `0.45`
+- `--click-post-esc-delay-min`：按下 ESC 后最小额外等待时间（秒），默认 `0.20`
+- `--click-post-esc-delay-max`：按下 ESC 后最大额外等待时间（秒），默认 `0.60`
+- `--wait-click-restart-timeout`：按下 ESC 后等待重新开始的超时（秒），默认 `5.0`；超时会立即执行一次阶段重检并继续流程
 
 ### 看门狗
 
