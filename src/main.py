@@ -1178,17 +1178,23 @@ def run_controller(args: argparse.Namespace) -> None:
                     and wait_click_state_enter_time is not None
                     and (now - wait_click_state_enter_time) >= wait_click_restart_timeout
                 ):
-                    recovered_stage = detect_recovery_stage(screen_bgr, screen_gray)
-                    workflow_state = recovered_stage
-                    wait_click_state_enter_time = now if workflow_state == "wait_click_disappear" else None
+                    print(f"按下 ESC 后 {wait_click_restart_timeout:.1f}s 未重启，直接再次执行 ESC 触发。")
+                    click_delay = random.uniform(click_reaction_min, click_reaction_max)
+                    if click_delay > 0:
+                        time.sleep(click_delay)
+
+                    bring_window_foreground(target_window.hwnd)
+                    press_key_sendinput("esc")
+                    click_post_esc_delay = random.uniform(click_post_esc_delay_min, click_post_esc_delay_max)
+                    if click_post_esc_delay > 0:
+                        time.sleep(click_post_esc_delay)
+
+                    # 重新计时并停留在当前阶段等待重开
+                    last_click_time = time.time()
+                    wait_click_state_enter_time = time.time()
                     click_gone_frames = 0
-                    just_entered_qe = workflow_state == "qe_phase"
-                    last_any_detection_time = now
+                    last_any_detection_time = time.time()
                     watchdog_timeout_streak = 0
-                    print(
-                        f"按下 ESC 后 {wait_click_restart_timeout:.1f}s 未重启，"
-                        f"已执行阶段重检并切换到: {workflow_state}"
-                    )
 
             elif workflow_state == "qe_phase":
                 if just_entered_qe:
